@@ -35,8 +35,15 @@ When your prototype is ready, create a Pull Request to merge it into the main br
 
 ## Documentation
 
+### Quick Start Guides
+- **[Onboarding Guide](ONBOARDING.md)**: New team member guide - start here!
+- **[Quick Reference](QUICK_REFERENCE.md)**: Command cheat sheet for daily use
+
+### Detailed Guides
 - **[Branching Guide](BRANCHING_GUIDE.md)**: Detailed branching strategy and workflow
 - **[Contributing Guidelines](CONTRIBUTING.md)**: How to contribute to the project
+- **[Merge Workflow](MERGE_WORKFLOW.md)**: Step-by-step merge process
+- **[Workflow Visualization](WORKFLOW_VISUALIZATION.md)**: Visual diagrams of the workflow
 
 ## Branch Structure
 
