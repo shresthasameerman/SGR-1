@@ -1,0 +1,100 @@
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Compiled files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+*.dll
+*.dylib
+*.class
+*.o
+*.obj
+*.exe
+
+# Build directories
+build/
+dist/
+target/
+out/
+bin/
+*.egg-info/
+.eggs/
+
+# Package manager directories
+node_modules/
+bower_components/
+vendor/
+packages/
+
+# Virtual environments
+venv/
+env/
+ENV/
+virtualenv/
+.venv/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.cache
+*.pid
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Coverage reports
+coverage/
+.coverage
+*.coverage
+htmlcov/
+.nyc_output/
+
+# Test outputs
+.pytest_cache/
+.tox/
+.nox/
+
+# Environment files (should not be committed)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+
+# Certificates and keys
+*.pem
+*.key
+*.cert
+*.crt
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+*.7z
