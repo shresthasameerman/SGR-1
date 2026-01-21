@@ -1,0 +1,76 @@
+import time
+from datetime import import datetime
+
+# Connect to the GPS session
+session = gps.gps(host="127.0.0.1", port=2947)
+session.stream(gps.WATCH_ENABLE | gps.WATCH_NEWSTYLE)
+
+print("GPS Location Tracker Started...")
+print("Waiting for GPS fix...\n")
+
+# Initialize used = 0
+satellites_used = 0
+
+try:
+    while True:
+        try:
+            report = session.next()
+            
+            # Check for satellite data
+            if report['class'] == 'SKY':
+                # Count satellites being used
+                if hasattr(report, 'uSat'):
+                    satellites_used = report.uSat
+                    
+            # Check for position report
+            elif hasattr(report, 'satellites'):
+                satellites_used = sum(1 for sat in report.satellites if sat.get('used', False))
+            
+            # Check if this is a position report
+            if report['class'] == 'TPV':
+                # Get position data if available
+                if hasattr(report, 'lat') and hasattr(report, 'lon'):
+                    latitude = report.lat
+                    longitude = report.lon
+                    
+                    # Get optional data with defaults
+                    altitude = getattr(report, 'alt', 'N/A')
+                    speed = getattr(report, 'speed', 'N/A')
+                    time_utc = getattr(report, 'time', 'N/A')
+                    
+                    # Clear screen and display info
+                    print("\033[2J\033[H") # Clear screen
+                    print("="*50)
+                    print(f"GPS LOCATION")
+                    print("="*50)
+                    print(f"Latitude:   {latitude:.6f}°")
+                    print(f"Longitude:  {longitude:.6f}°")
+                    print(f"Altitude:   {altitude}m" if altitude != 'N/A' else f"Altitude:  N/A")
+                    print(f"Speed:      {speed}m/s" if speed != 'N/A' else f"Speed:     N/A")
+                    print(f"Time (UTC): {time_utc}")
+                    print(f"Satellites: {satellites_used}")
+                    print("="*50)
+                    print(f"Google Maps Link:")
+                    print(f"https://www.google.com/maps/place/{latitude},{longitude}")
+                    print("\nPress Ctrl+C to stop.")
+                    print("=" * 50)
+                    
+                else:
+                    print("Waiting for GPS fix... (satellites: {satellites_used})")
+                    
+        except KeyError:
+            pass
+        except StopIteration:
+            session = None
+            print("GPSD has terminated")
+            break
+            
+        time.sleep(1)  # Update every second
+        
+except KeyboardInterrupt:
+    print("\nGPS Tracker Stopped")
+except Exception as e:
+    print(f"Error: {e}")
+finally:
+    if session:
+        session.close()
