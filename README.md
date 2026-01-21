@@ -35,6 +35,8 @@ When your prototype is ready, create a Pull Request to merge it into the main br
 
 ## Documentation
 
+📋 **[Complete Documentation Index](DOCUMENTATION_INDEX.md)** - Navigate all documentation
+
 ### Quick Start Guides
 - **[Onboarding Guide](ONBOARDING.md)**: New team member guide - start here!
 - **[Quick Reference](QUICK_REFERENCE.md)**: Command cheat sheet for daily use
