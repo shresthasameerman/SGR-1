@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""
+Autonomous GPS-Guided Robot with IMU-based PID Control
+Combines GPS navigation, MPU6050 IMU, and Sabertooth motor control
+"""
+
+import serial
+import smbus
+import socket
+import json
+import time
+import math
+from datetime import datetime
+from collections import deque
+
+# ============================================================================
+# SABERTOOTH MOTOR CONTROLLER
+# ============================================================================
+class Sabertooth2x60Serial:
+    def __init__(self, port='/dev/serial0', baudrate=9600, address=128):
+        self.address = address
+        import os
+        possible_ports = [port, '/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0']
+        
+        actual_port = None
+        for p in possible_ports:
+            if os.path.exists(p):
+                actual_port = p
+                break
+        
+        if actual_port is None:
+            raise Exception("No serial port found! Enable UART with raspi-config")
+        
+        print(f"Using serial port: {actual_port}")
+        
+        self.serial = serial.Serial(
+            port=actual_port,
+            baudrate=baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=1
+        )
+        time.sleep(0.1)
+        print(f"Sabertooth initialized at {baudrate} baud, address {address}")
+    
+    def _send_command(self, command, data):
+        data = max(0, min(127, data))
+        checksum = (self.address + command + data) & 0x7F
+        packet = bytes([self.address, command, data, checksum])
+        self.serial.write(packet)
+        return packet
+    
+    def motor1_forward(self, speed):
+        speed = max(0, min(127, speed))
+        self._send_command(0, speed)
+    
+    def motor1_reverse(self, speed):
+        speed = max(0, min(127, speed))
+        self._send_command(1, speed)
+    
+    def motor2_forward(self, speed):
+        speed = max(0, min(127, speed))
+        self._send_command(4, speed)
+    
+    def motor2_reverse(self, speed):
+        speed = max(0, min(127, speed))
+        self._send_command(5, speed)
+    
+    def set_motor1(self, speed):
+        """speed: -127 to +127"""
+        if speed >= 0:
+            self.motor1_forward(speed)
+        else:
+            self.motor1_reverse(abs(speed))
+    
+    def set_motor2(self, speed):
+        """speed: -127 to +127"""
+        if speed >= 0:
+            self.motor2_forward(speed)
+        else:
+            self.motor2_reverse(abs(speed))
+    
+    def stop_all(self):
+        self.motor1_forward(0)
+        self.motor2_forward(0)
+    
+    def cleanup(self):
+        self.stop_all()
+        time.sleep(0.1)
+        self.serial.close()
+
+
+# ============================================================================
+# MPU6050 IMU SENSOR
+# ============================================================================
+class MPU6050:
+    PWR_MGMT_1 = 0x6B
+    ACCEL_XOUT_H = 0x3B
+    GYRO_XOUT_H = 0x43
+    GYRO_CONFIG = 0x1B
+    ACCEL_CONFIG = 0x1C
+    
+    def __init__(self, address=0x68, bus=1):
+        self.address = address
+        self.bus = smbus.SMBus(bus)
+        
+        # Wake up MPU6050
+        self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0)
+        time.sleep(0.1)
+        
+        # Configure gyroscope (±250°/s)
+        self.bus.write_byte_data(self.address, self.GYRO_CONFIG, 0x00)
+        # Configure accelerometer (±2g)
+        self.bus.write_byte_data(self.address, self.ACCEL_CONFIG, 0x00)
+        
+        self.gyro_scale = 131.0  # LSB/(°/s) for ±250°/s
+        self.accel_scale = 16384.0  # LSB/g for ±2g
+        
+        # Calibration offsets
+        self.gyro_x_offset = 0
+        self.gyro_y_offset = 0
+        self.gyro_z_offset = 0
+        
+        # Angle tracking
+        self.angle_z = 0.0  # Yaw angle
+        self.last_time = time.time()
+        
+        print("MPU6050 initialized")
+    
+    def read_raw_data(self, addr):
+        high = self.bus.read_byte_data(self.address, addr)
+        low = self.bus.read_byte_data(self.address, addr + 1)
+        value = (high << 8) | low
+        if value > 32768:
+            value = value - 65536
+        return value
+    
+    def calibrate(self, samples=100):
+        """Calibrate gyroscope by averaging readings while stationary"""
+        print(f"Calibrating IMU... Keep robot still! ({samples} samples)")
+        
+        gyro_x_sum = 0
+        gyro_y_sum = 0
+        gyro_z_sum = 0
+        
+        for i in range(samples):
+            gyro_x_sum += self.read_raw_data(self.GYRO_XOUT_H)
+            gyro_y_sum += self.read_raw_data(self.GYRO_XOUT_H + 2)
+            gyro_z_sum += self.read_raw_data(self.GYRO_XOUT_H + 4)
+            time.sleep(0.01)
+        
+        self.gyro_x_offset = gyro_x_sum / samples
+        self.gyro_y_offset = gyro_y_sum / samples
+        self.gyro_z_offset = gyro_z_sum / samples
+        
+        print(f"Calibration complete!")
+        print(f"Offsets - X: {self.gyro_x_offset:.1f}, Y: {self.gyro_y_offset:.1f}, Z: {self.gyro_z_offset:.1f}")
+    
+    def read_gyro(self):
+        """Read gyroscope data in °/s"""
+        gyro_x = (self.read_raw_data(self.GYRO_XOUT_H) - self.gyro_x_offset) / self.gyro_scale
+        gyro_y = (self.read_raw_data(self.GYRO_XOUT_H + 2) - self.gyro_y_offset) / self.gyro_scale
+        gyro_z = (self.read_raw_data(self.GYRO_XOUT_H + 4) - self.gyro_z_offset) / self.gyro_scale
+        return gyro_x, gyro_y, gyro_z
+    
+    def read_accel(self):
+        """Read accelerometer data in g's"""
+        acc_x = self.read_raw_data(self.ACCEL_XOUT_H) / self.accel_scale
+        acc_y = self.read_raw_data(self.ACCEL_XOUT_H + 2) / self.accel_scale
+        acc_z = self.read_raw_data(self.ACCEL_XOUT_H + 4) / self.accel_scale
+        return acc_x, acc_y, acc_z
+    
+    def update_angle(self):
+        """Update yaw angle using gyroscope integration with drift compensation"""
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        
+        # Limit dt to prevent huge jumps
+        if dt > 0.5:  # If more than 500ms, reset timing
+            dt = 0.01
+        
+        _, _, gyro_z = self.read_gyro()
+        
+        # Apply dead zone to reduce drift when stationary
+        if abs(gyro_z) < 0.5:  # Dead zone threshold
+            gyro_z = 0
+        
+        # Integrate angular velocity to get angle
+        self.angle_z += gyro_z * dt
+        
+        # Normalize angle to 0-360
+        self.angle_z = self.angle_z % 360
+        if self.angle_z < 0:
+            self.angle_z += 360
+        
+        return self.angle_z
+    
+    def reset_angle(self, angle=0.0):
+        """Reset the current angle to a specific value"""
+        self.angle_z = angle
+        self.last_time = time.time()
+
+
+# ============================================================================
+# PID CONTROLLER
+# ============================================================================
+class PIDController:
+    def __init__(self, kp, ki, kd, setpoint=0, output_limits=(-127, 127)):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.setpoint = setpoint
+        self.output_limits = output_limits
+        
+        self.integral = 0
+        self.last_error = 0
+        self.last_time = time.time()
+    
+    def update(self, current_value):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        
+        if dt <= 0:
+            dt = 0.01
+        
+        # Calculate error
+        error = self.setpoint - current_value
+        
+        # Normalize angle error to -180 to 180
+        while error > 180:
+            error -= 360
+        while error < -180:
+            error += 360
+        
+        # Proportional term
+        p_term = self.kp * error
+        
+        # Integral term
+        self.integral += error * dt
+        # Anti-windup
+        self.integral = max(-100, min(100, self.integral))
+        i_term = self.ki * self.integral
+        
+        # Derivative term
+        d_term = self.kd * (error - self.last_error) / dt
+        
+        # Calculate output
+        output = p_term + i_term + d_term
+        
+        # Apply limits
+        output = max(self.output_limits[0], min(self.output_limits[1], output))
+        
+        # Update state
+        self.last_error = error
+        self.last_time = current_time
+        
+        return output, error
+    
+    def reset(self):
+        self.integral = 0
+        self.last_error = 0
+        self.last_time = time.time()
+
+
+# ============================================================================
+# GPS NAVIGATION FUNCTIONS
+# ============================================================================
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    """Calculate bearing from point 1 to point 2 in degrees (0-360)"""
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    lon_diff = math.radians(lon2 - lon1)
+    
+    x = math.sin(lon_diff) * math.cos(lat2_rad)
+    y = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(lon_diff)
+    
+    bearing_rad = math.atan2(x, y)
+    bearing_deg = math.degrees(bearing_rad)
+    bearing_deg = (bearing_deg + 360) % 360
+    
+    return bearing_deg
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two points in meters"""
+    R = 6371000
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_lat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return R * c
+
+
+# ============================================================================
+# AUTONOMOUS ROBOT CONTROLLER
+# ============================================================================
+class AutonomousRobot:
+    def __init__(self, motor_controller, imu, target_lat, target_lon):
+        self.motor = motor_controller
+        self.imu = imu
+        self.target_lat = target_lat
+        self.target_lon = target_lon
+        
+        # PID controller for heading control
+        # Tuning parameters: Adjust these for your robot
+        self.heading_pid = PIDController(
+            kp=1.5,      # Proportional gain
+            ki=0.05,     # Integral gain
+            kd=0.3,      # Derivative gain
+            setpoint=0,
+            output_limits=(-80, 80)  # Max turning correction
+        )
+        
+        # Robot parameters
+        self.base_speed = 40  # Base forward speed (0-127)
+        self.min_speed = 15   # Minimum motor speed to overcome friction
+        self.turn_threshold = 5  # Degrees - if error is less, go straight
+        self.arrival_threshold = 3  # Meters - target reached threshold
+        
+        # State
+        self.current_lat = None
+        self.current_lon = None
+        self.target_bearing = 0
+        self.distance_to_target = float('inf')
+        
+    def update_gps(self, lat, lon):
+        """Update current GPS position"""
+        self.current_lat = lat
+        self.current_lon = lon
+        
+        # Calculate navigation parameters
+        self.target_bearing = calculate_bearing(lat, lon, self.target_lat, self.target_lon)
+        self.distance_to_target = calculate_distance(lat, lon, self.target_lat, self.target_lon)
+    
+    def navigate(self):
+        """Main navigation control loop - call this repeatedly"""
+        if self.current_lat is None:
+            self.motor.stop_all()
+            return "WAITING_GPS", 0, 0
+        
+        # Update IMU angle
+        current_heading = self.imu.update_angle()
+        
+        # Set PID target to desired bearing
+        self.heading_pid.setpoint = self.target_bearing
+        
+        # Get PID correction
+        correction, heading_error = self.heading_pid.update(current_heading)
+        
+        # Check if target reached
+        if self.distance_to_target < self.arrival_threshold:
+            self.motor.stop_all()
+            return "ARRIVED", 0, 0
+        
+        # Determine motor speeds based on heading error
+        if abs(heading_error) < self.turn_threshold:
+            # Go straight - heading is good
+            left_speed = self.base_speed
+            right_speed = self.base_speed
+            state = "FORWARD"
+        else:
+            # Apply differential drive with PID correction
+            # Positive correction = turn right (left motor faster)
+            # Negative correction = turn left (right motor faster)
+            left_speed = self.base_speed + correction
+            right_speed = self.base_speed - correction
+            
+            # Ensure minimum speed
+            if abs(left_speed) < self.min_speed and left_speed != 0:
+                left_speed = self.min_speed if left_speed > 0 else -self.min_speed
+            if abs(right_speed) < self.min_speed and right_speed != 0:
+                right_speed = self.min_speed if right_speed > 0 else -self.min_speed
+            
+            # Clamp to valid range
+            left_speed = max(-127, min(127, int(left_speed)))
+            right_speed = max(-127, min(127, int(right_speed)))
+            
+            if correction > 0:
+                state = "TURN_RIGHT"
+            else:
+                state = "TURN_LEFT"
+        
+        # Send commands to motors
+        self.motor.set_motor1(int(left_speed))
+        self.motor.set_motor2(int(right_speed))
+        
+        return state, left_speed, right_speed
+
+
+# ============================================================================
+# MAIN PROGRAM
+# ============================================================================
+def main():
+    print("=" * 70)
+    print("AUTONOMOUS GPS-GUIDED ROBOT WITH IMU-BASED PID CONTROL")
+    print("=" * 70)
+    
+    # Get target coordinates
+    print("\n--- TARGET COORDINATES ---")
+    while True:
+        try:
+            target_lat = float(input("Target Latitude: "))
+            target_lon = float(input("Target Longitude: "))
+            break
+        except ValueError:
+            print("Invalid input! Please enter valid numbers.")
+    
+    print(f"\nTarget set to: {target_lat:.6f}, {target_lon:.6f}")
+    
+    # Initialize hardware
+    print("\n--- INITIALIZING HARDWARE ---")
+    
+    # First, check and kill any process using the serial port
+    print("Checking for processes using serial port...")
+    import subprocess
+    try:
+        # Try to identify and kill process using serial port
+        result = subprocess.run(['sudo', 'fuser', '-k', '/dev/serial0'], 
+                              capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            print("Killed previous process using serial port")
+            time.sleep(1)
+    except:
+        pass
+    
+    try:
+        motor = Sabertooth2x60Serial()
+        imu = MPU6050()
+        
+        # Calibrate IMU
+        print("\n*** IMPORTANT: Keep robot COMPLETELY STILL for calibration! ***")
+        time.sleep(2)
+        imu.calibrate(samples=500)  # More samples for better calibration
+        
+        # Reset angle to match initial GPS bearing
+        print("\n*** Point robot toward target before starting ***")
+        print("Press ENTER when robot is facing the target direction...")
+        input()
+        
+        imu.reset_angle(0)
+        print("IMU angle reset to 0° (current direction)")
+        
+        print("\nHardware initialized successfully!")
+        
+    except Exception as e:
+        print(f"\nError initializing hardware: {e}")
+        print("\n--- TROUBLESHOOTING STEPS ---")
+        print("1. Check if another program is using /dev/serial0:")
+        print("   sudo fuser -v /dev/serial0")
+        print("\n2. Kill the process using the port:")
+        print("   sudo fuser -k /dev/serial0")
+        print("\n3. Disable serial console (if enabled):")
+        print("   sudo raspi-config")
+        print("   → Interface Options → Serial Port")
+        print("   → Login shell: NO, Hardware enabled: YES")
+        print("\n4. Check /boot/config.txt has:")
+        print("   enable_uart=1")
+        print("   dtoverlay=disable-bt")
+        print("\n5. Reboot if needed:")
+        print("   sudo reboot")
+        return
+    
+    # Create autonomous controller
+    robot = AutonomousRobot(motor, imu, target_lat, target_lon)
+    
+    # Connect to GPS
+    print("\n--- CONNECTING TO GPSD ---")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(('127.0.0.1', 2947))
+        print("Connected to GPSD successfully!")
+        
+        sock.send(b'?WATCH={"enable":true,"json":true}\n')
+        print("Sent WATCH command to GPSD")
+        
+        # Wait for initial response
+        print("Waiting for GPS data...")
+        time.sleep(2)
+        
+    except socket.timeout:
+        print(f"\nError: Connection to GPSD timed out")
+        print("GPSD may not be running. Try: sudo systemctl start gpsd")
+        motor.cleanup()
+        return
+    except ConnectionRefusedError:
+        print(f"\nError: Could not connect to GPSD on port 2947")
+        print("\nTroubleshooting:")
+        print("1. Check if GPSD is running:")
+        print("   sudo systemctl status gpsd")
+        print("\n2. Start GPSD if not running:")
+        print("   sudo systemctl start gpsd")
+        print("\n3. Check GPS device is connected:")
+        print("   ls -l /dev/ttyACM* /dev/ttyUSB*")
+        print("\n4. Test GPS manually:")
+        print("   cgps -s")
+        motor.cleanup()
+        return
+    except Exception as e:
+        print(f"Error connecting to GPSD: {e}")
+        motor.cleanup()
+        return
+    
+    # Main loop
+    buffer = ""
+    satellites_used = 0
+    satellites_visible = 0
+    gps_data_received = False
+    loop_count = 0
+    
+    try:
+        print("\n" + "=" * 70)
+        print("AUTONOMOUS NAVIGATION STARTED")
+        print("Press Ctrl+C to stop")
+        print("=" * 70 + "\n")
+        
+        while True:
+            try:
+                data = sock.recv(4096).decode('utf-8')
+                if not data:
+                    print("No data received from GPSD - connection may be closed")
+                    break
+                    
+                buffer += data
+                loop_count += 1
+                
+                # Debug: show we're receiving data
+                if loop_count % 100 == 0:
+                    print(f"[DEBUG] Received {loop_count} messages, buffer size: {len(buffer)}")
+                
+            except socket.timeout:
+                print("Socket timeout - no data from GPSD")
+                continue
+            except Exception as e:
+                print(f"Error receiving data: {e}")
+                break
+            
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip()
+                
+                if not line:
+                    continue
+                
+                try:
+                    obj = json.loads(line)
+                    gps_data_received = True
+                    
+                    # Debug: show message types
+                    if loop_count < 50:  # Only for first 50 messages
+                        msg_class = obj.get('class', 'UNKNOWN')
+                        print(f"[DEBUG] Message: {msg_class}")
+                    
+                    # Handle VERSION message
+                    if obj.get('class') == 'VERSION':
+                        print(f"GPSD Version: {obj.get('release', 'unknown')}")
+                    
+                    # Handle satellite data - try multiple methods
+                    if obj.get('class') == 'SKY':
+                        if 'satellites' in obj:
+                            satellites_visible = len(obj.get('satellites', []))
+                        if 'uSat' in obj:
+                            satellites_used = obj.get('uSat', 0)
+                        elif 'nSat' in obj:
+                            satellites_used = obj.get('nSat', 0)
+                        # Debug satellite data
+                        print(f"[SKY] Used: {satellites_used}, Visible: {satellites_visible}")
+                    
+                    # Handle GPS position data
+                    if obj.get('class') == 'TPV':
+                        # Try to get satellite count from TPV message
+                        if 'nSat' in obj and obj['nSat'] > 0:
+                            satellites_used = obj['nSat']
+                        
+                        # Also check mode
+                        gps_mode = obj.get('mode', 0)
+                        
+                        if 'lat' not in obj or 'lon' not in obj:
+                            # GPS doesn't have a fix yet
+                            print("\033[2J\033[H")  # Clear screen
+                            print("=" * 70)
+                            print("WAITING FOR GPS FIX")
+                            print("=" * 70)
+                            print(f"\nSatellites: {satellites_used} connected")
+                            print(f"Mode: {gps_mode} (need mode 2 or 3 for fix)")
+                            print("\nWaiting for position data...")
+                            print("This can take 1-5 minutes outdoors with clear sky view")
+                            print("\nPress Ctrl+C to stop")
+                            time.sleep(1)
+                            continue
+                        
+                        # We have lat/lon - proceed with navigation
+                        latitude = obj['lat']
+                        longitude = obj['lon']
+                        
+                        # Update robot with new GPS position
+                        robot.update_gps(latitude, longitude)
+                        
+                        # Run navigation control
+                        state, left_speed, right_speed = robot.navigate()
+                        
+                        # Display status
+                        print("\033[2J\033[H")  # Clear screen
+                        print("=" * 70)
+                        print("AUTONOMOUS ROBOT NAVIGATION STATUS")
+                        print("=" * 70)
+                        
+                        print(f"\n--- GPS STATUS ---")
+                        gps_mode = obj.get('mode', 0)
+                        
+                        # Determine fix quality based on satellites AND position error
+                        pos_error = max(obj.get('epx', 999), obj.get('epy', 999))
+                        if satellites_used >= 6 and pos_error < 10:
+                            quality = "Excellent"
+                        elif satellites_used >= 4 and pos_error < 20:
+                            quality = "Good"
+                        elif satellites_used >= 3 and pos_error < 50:
+                            quality = "Fair"
+                        else:
+                            quality = "Poor (indoor/obstructed)"
+                        
+                        print(f"Satellites: {satellites_used} used, {satellites_visible} visible")
+                        print(f"Mode: {gps_mode} (3D Fix) | Fix Quality: {quality}")
+                        print(f"Current: {latitude:.6f}, {longitude:.6f}")
+                        print(f"Target:  {target_lat:.6f}, {target_lon:.6f}")
+                        print(f"Distance: {robot.distance_to_target:.2f} m ({robot.distance_to_target/1000:.2f} km)")
+                        
+                        # Show accuracy if available
+                        if 'epx' in obj and 'epy' in obj:
+                            print(f"Position Error: ±{obj['epx']:.1f}m (East), ±{obj['epy']:.1f}m (North)")
+                            if pos_error > 20:
+                                print(f"⚠ WARNING: High position error - move to open area!")
+                        
+                        print(f"\n--- NAVIGATION ---")
+                        print(f"Target Bearing:  {robot.target_bearing:.1f}° (direction to target)")
+                        print(f"Current Heading: {imu.angle_z:.1f}° (robot facing direction)")
+                        print(f"Heading Error:   {robot.heading_pid.last_error:.1f}° (need to turn)")
+                        
+                        # Show compass directions for clarity
+                        def get_compass(angle):
+                            dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                            idx = int((angle + 22.5) / 45) % 8
+                            return dirs[idx]
+                        
+                        print(f"  Target is:     {get_compass(robot.target_bearing)} ({robot.target_bearing:.0f}°)")
+                        print(f"  Robot faces:   {get_compass(imu.angle_z)} ({imu.angle_z:.0f}°)")
+                        
+                        print(f"\n--- CONTROL ---")
+                        print(f"State:       {state}")
+                        print(f"Left Motor:  {left_speed:4d}/127")
+                        print(f"Right Motor: {right_speed:4d}/127")
+                        
+                        if state == "ARRIVED":
+                            print(f"\n{'*' * 70}")
+                            print("*** 🎯 TARGET REACHED! ***".center(70))
+                            print(f"{'*' * 70}")
+                            time.sleep(5)
+                            break
+                        
+                        print("\n" + "=" * 70)
+                        print(f"Time: {datetime.now().strftime('%H:%M:%S')} | Press Ctrl+C to stop")
+                        print("=" * 70)
+                        
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    print(f"Error processing data: {e}")
+            
+            time.sleep(0.05)  # Small delay for loop stability
+            
+    except KeyboardInterrupt:
+        print("\n\nNavigation stopped by user")
+    except Exception as e:
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\nCleaning up...")
+        motor.cleanup()
+        try:
+            sock.close()
+        except:
+            pass
+        print("Shutdown complete")
+
+
+if __name__ == "__main__":
+    main()
